@@ -1,0 +1,42 @@
+version: "3.9"
+services:
+  # The Python API layer
+  sanitizer:
+    build: .
+    ports: 
+      - "8000:8000"
+    environment:
+      - CACHE_BACKEND=redis
+      - REDIS_URL=redis://redis:6379/0
+      - APP_ENV=production
+    depends_on: 
+      - redis
+    deploy:
+      replicas: 2  # Run two instances automatically for high availability (Load balanced)
+      resources:
+        limits: 
+          cpus: "2.0"
+          memory: "2G"
+
+  # The In-Memory Cache
+  redis:
+    image: redis:7-alpine
+    ports: 
+      - "6379:6379"
+    command: redis-server --save 60 1 --loglevel warning
+
+  # The Metrics Scraper
+  prometheus:
+    image: prom/prometheus:latest
+    ports: 
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+
+  # The Dashboard Viewer
+  grafana:
+    image: grafana/grafana:latest
+    ports: 
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin

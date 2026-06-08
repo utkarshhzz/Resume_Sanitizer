@@ -1,0 +1,8 @@
+# Scrape configuration for Prometheus
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "resume-sanitizer"
+    static_configs:
+      - targets: ["sanitizer:8000"]
