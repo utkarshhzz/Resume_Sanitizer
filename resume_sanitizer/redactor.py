@@ -130,6 +130,19 @@ def apply_redactions(doc: fitz.Document, targets: list[RedactionTarget]) -> byte
         # PDF_REDACT_IMAGE_NONE ensures that we don't accidentally black out the background 
         # document image if this was a scanned resume! We only destroy the TEXT in that area.
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+        
+        # Step 2.5: Purge Clickable Hyperlinks (e.g. LinkedIn, GitHub)
+        # Even if visual text is destroyed, the <a> tag link rectangle might survive!
+        for link in page.get_links():
+            uri = link.get("uri", "").lower()
+            if any(domain in uri for domain in ["linkedin.com", "github.com", "wa.me", "mailto:", "facebook.com", "twitter.com", "portfolio", "bit.ly"]):
+                # Add a redaction to that exact link box to erase any underlying text
+                page.add_redact_annot(link["from"], fill=settings.REDACTION_FILL_COLOR)
+                # Sever the digital hyperlink connection
+                page.delete_link(link)
+                
+        # Must apply redactions AGAIN just in case the link loop caught something new
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
     # Step 3: Scrub Document Metadata (Crucial for Security!)
     # Sometimes resumes have "Author: John Doe" in the hidden file properties.

@@ -130,7 +130,7 @@ async def list_entities():
     return {"supported_entities": sorted(custom_entities + nlp_entities)}
 
 
-async def process_pdf(request: Request, file_bytes: bytes, filename: str, min_confidence: float, redaction_mode: bool) -> tuple[bytes | None, SanitizeResponse]:
+async def process_pdf(request: Request, file_bytes: bytes, filename: str, min_confidence: float, redaction_mode: bool, redact_types: str | None = None) -> tuple[bytes | None, SanitizeResponse]:
     """
     Core business logic pipeline extracted into a helper for reuse across single/batch endpoints.
     Returns (sanitized_pdf_bytes, metadata_response). 
@@ -171,6 +171,12 @@ async def process_pdf(request: Request, file_bytes: bytes, filename: str, min_co
 
     # 3. Pipeline: 3-Layer PII Analysis
     entities = await loop.run_in_executor(None, analyze, request.app.state.analyzer, doc, blocks, ocr_used, min_confidence)
+    
+    # Feature: Selective Redaction
+    if redact_types:
+        user_requested_types = {t.strip().upper() for t in redact_types.split(",")}
+        entities = [e for e in entities if e.entity_type.upper() in user_requested_types]
+
     metrics.PII_ENTITIES_FOUND.observe(len(entities))
 
     sanitized_bytes = None
@@ -223,7 +229,14 @@ async def sanitize_resume(
 
     pdf_bytes = await file.read()
     
-    sanitized_bytes, metadata = await process_pdf(request, pdf_bytes, file.filename or "upload.pdf", min_confidence, redaction_mode=True)
+    sanitized_bytes, metadata = await process_pdf(
+        request=request, 
+        file_bytes=pdf_bytes, 
+        filename=file.filename or "upload.pdf", 
+        min_confidence=min_confidence, 
+        redaction_mode=True, 
+        redact_types=redact_types
+    )
     
     headers = {
         "Content-Disposition": f'attachment; filename="sanitized_{file.filename}"',
@@ -257,7 +270,13 @@ async def analyze_only(
         raise InvalidFileTypeError()
 
     pdf_bytes = await file.read()
-    _, metadata = await process_pdf(request, pdf_bytes, file.filename or "upload.pdf", min_confidence, redaction_mode=False)
+    _, metadata = await process_pdf(
+        request=request, 
+        file_bytes=pdf_bytes, 
+        filename=file.filename or "upload.pdf", 
+        min_confidence=min_confidence, 
+        redaction_mode=False
+    )
     
     return metadata
 
@@ -276,7 +295,13 @@ async def batch_sanitize(
             
         pdf_bytes = await f.read()
         try:
-            sanitized_bytes, metadata = await process_pdf(request, pdf_bytes, f.filename or "upload.pdf", min_confidence, redaction_mode=True)
+            sanitized_bytes, metadata = await process_pdf(
+                request=request, 
+                file_bytes=pdf_bytes, 
+                filename=f.filename or "upload.pdf", 
+                min_confidence=min_confidence, 
+                redaction_mode=True
+            )
             
             # Encode so we can return standard JSON
             encoded = base64.b64encode(sanitized_bytes).decode('utf-8') if sanitized_bytes else None # type: ignore

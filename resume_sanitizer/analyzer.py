@@ -59,7 +59,7 @@ REGEX_DEFINITIONS = [
     ),
     CustomEntityContext(
         entity="PINCODE_IN",
-        patterns=[Pattern("pincode_regex", r"\b[1-9][0-9]{5}\b", 0.75)],
+        patterns=[Pattern("pincode_regex", r"\b[1-9][0-9]{5}\b", 0.40)],
         context=["pincode", "pin", "postal", "zip"]
     ),
     CustomEntityContext(
@@ -80,12 +80,12 @@ REGEX_DEFINITIONS = [
     CustomEntityContext(
         entity="DATE_OF_BIRTH",
         # Matches DD-MM-YYYY, DD/MM/YYYY, etc.
-        patterns=[Pattern("dob_regex", r"\b(0?[1-9]|[12]\d|3[01])[\/\-](0?[1-9]|1[0-2])[\/\-](19|20)\d{2}\b", 0.80)],
+        patterns=[Pattern("dob_regex", r"\b(0?[1-9]|[12]\d|3[01])[\/\-](0?[1-9]|1[0-2])[\/\-](19|20)\d{2}\b", 0.40)],
         context=["dob", "date of birth", "born", "birth"]
     ),
     CustomEntityContext(
         entity="BANK_ACCOUNT_IN",
-        patterns=[Pattern("bank_acc_regex", r"\b\d{9,18}\b", 0.70)],
+        patterns=[Pattern("bank_acc_regex", r"\b\d{9,18}\b", 0.30)],
         context=["account", "acc no", "bank", "ac/no"]
     ),
     CustomEntityContext(
@@ -246,8 +246,9 @@ def analyze(analyzer: AnalyzerEngine, doc: fitz.Document, blocks: list[PageTextB
     all_entities: list[PIIEntity] = []
     
     # Layer 1 (Regex) + Layer 2 (Presidio NLP)
-    # We ask Presidio to look for our custom entities AND its built-in ones (like PERSON, LOCATION)
-    entities_to_find = [d.entity for d in REGEX_DEFINITIONS] + ["PERSON", "LOCATION", "ORG", "US_SSN", "UK_NHS"]
+    # We purposefully exclude "ORG", "LOCATION" by default so we don't accidentally erase 
+    # colleges (Indian Institute of Technology) or technical skills (Microsoft Azure).
+    entities_to_find = [d.entity for d in REGEX_DEFINITIONS] + ["PERSON", "US_SSN"]
 
     for block in blocks:
         # Analyze using Microsoft Presidio
