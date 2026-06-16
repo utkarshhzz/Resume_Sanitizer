@@ -12,6 +12,24 @@ from resume_sanitizer.utils import expand_rect, merge_overlapping_rects, normali
 
 logger = logging.getLogger(__name__)
 
+# 🎓 Teacher Note: Domains that ALWAYS reveal candidate identity.
+# If a PDF has a clickable hyperlink to any of these, we sever it
+# even if the regex somehow missed the visible text.
+IDENTITY_LINK_DOMAINS = [
+    "linkedin.com", "github.com", "gitlab.com", "bitbucket.org",
+    "twitter.com", "x.com", "instagram.com", "facebook.com",
+    "wa.me", "t.me", "telegram.me",
+    "medium.com", "dev.to", "hashnode.dev",
+    "stackoverflow.com", "stackexchange.com",
+    "behance.net", "dribbble.com", "codepen.io",
+    "kaggle.com", "leetcode.com", "hackerrank.com", "codeforces.com",
+    "youtube.com", "vimeo.com",
+    "portfolio", "personal", "blog",
+    # Email links
+    "mailto:",
+]
+
+
 def build_redaction_targets(
     doc: fitz.Document, 
     entities: list[PIIEntity], 
@@ -21,6 +39,13 @@ def build_redaction_targets(
     """
     Translates textual PII entities into physical geometric rectangles (bounding boxes)
     that we need to redact on the PDF pages.
+    
+    🎓 Teacher Note: This is the trickiest part of the entire system.
+    The analyzer found "john@email.com" at character offset 45-59 in the text.
+    But to erase it from the PDF, we need its PIXEL COORDINATES (x0, y0, x1, y1).
+    
+    Digital path: Ask PyMuPDF to search for the text string → it returns coordinates.
+    OCR path: We already have coordinates from Tesseract for each word → we map offsets to words.
     """
     targets: list[RedactionTarget] = []
 
@@ -42,16 +67,19 @@ def build_redaction_targets(
 
         if not ocr_used:
             # --- DIGITAL PATH ---
-            # Native PDFs have a text layer. We can tell PyMuPDF to explicitly search for the text string.
+            # 🎓 Native PDFs have a hidden text layer. PyMuPDF can search this layer
+            # for a string and return the EXACT pixel coordinates where it appears.
             search_text = normalize_text_for_search(entity.text)
             
-            # quads=True returns a quadrilateral (4-point polygon) encompassing the text precisely
+            # quads=True returns a quadrilateral (4-point polygon) encompassing the text
             quads = page.search_for(search_text, quads=True)
             
-            # Fallback: Sometimes long entities get wrapped tightly spanning multiple lines causing failure. 
-            # We search the first 15 chars as a fuzzy fallback.
+            # Fallback: Sometimes long entities span lines and PyMuPDF can't find them.
+            # We try progressively shorter prefixes.
             if len(quads) == 0 and len(search_text) > 15:
                 quads = page.search_for(search_text[:15], quads=True)
+            if len(quads) == 0 and len(search_text) > 8:
+                quads = page.search_for(search_text[:8], quads=True)
 
             for q in quads:
                 r = q.rect  # Convert Quad to Rect
@@ -64,11 +92,10 @@ def build_redaction_targets(
                 rects.append(expanded)
         else:
             # --- OCR PATH ---
-            # OCR PDFs have an invisible text layer. But Tesseract gave us bounding boxes for individual words!
+            # 🎓 For scanned PDFs, Tesseract gave us bounding boxes for each word.
+            # We map the entity's character offset to the matching word bboxes.
             page_block = block_map.get(entity.page)
             if page_block:
-                # We iteratively find each word's offset in the full text string.
-                # If a word's offset overlaps with our entity's [start, end] window, it's a match!
                 current_offset = 0
                 for w in page_block.words:
                     word_start = page_block.text.find(w.text, current_offset)
@@ -76,7 +103,7 @@ def build_redaction_targets(
                         continue
                     
                     word_end = word_start + len(w.text)
-                    current_offset = word_end # advance the pointer
+                    current_offset = word_end
                     
                     # Check for overlap: does the word intersect the PII entity text?
                     if max(word_start, entity.start) < min(word_end, entity.end):
@@ -88,8 +115,7 @@ def build_redaction_targets(
                         )
                         rects.append(expanded)
 
-        # Optimization: Merge neighboring rectangles so it looks like one solid black bar 
-        # instead of a fragmented dashed line over an email address.
+        # Merge neighboring rectangles so multi-word entities get one clean block
         merged_rects = merge_overlapping_rects(rects)
 
         if merged_rects:
@@ -106,56 +132,104 @@ def build_redaction_targets(
 
 def apply_redactions(doc: fitz.Document, targets: list[RedactionTarget]) -> bytes:
     """
-    Applies the redactions permanently to the PDF.
-    This does NOT just draw a black box on top. It deletes the physical text pathways 
-    from the PDF binary structure.
+    Applies redactions permanently to the PDF.
+    
+    🎓 Teacher Note: This is NOT just drawing a white box on top!
+    PyMuPDF's redaction system works in 2 steps:
+      1. add_redact_annot() — marks an area for deletion (like putting tape over it)
+      2. apply_redactions()  — PHYSICALLY REMOVES the text from the PDF binary structure
+    
+    After apply_redactions(), even if someone opens the PDF in a hex editor,
+    the original text bytes are GONE. This is true "deep redaction".
+    
+    We also scrub:
+      - Document metadata (Author, Title, Subject, etc.)
+      - XML metadata streams (XMP data)
+      - Clickable hyperlinks to social media / email
     """
     # Group targets by page to process page-by-page efficiently
     page_targets = defaultdict(list)
     for t in targets:
         page_targets[t.page_number].append(t)
 
-    for page_number, target_list in page_targets.items():
-        page = doc[page_number - 1]
+    # Process EVERY page, even those without text targets
+    # (because they might have hyperlinks that need purging)
+    for page_index in range(doc.page_count):
+        page_number = page_index + 1
+        page = doc[page_index]
+        target_list = page_targets.get(page_number, [])
         
-        # Step 1: Draw the Redaction Annotations
+        # Step 1: Draw the Redaction Annotations for detected PII text
         for target in target_list:
             for rect_coords in target.rects:
-                # fitz.Rect expects (x0, y0, x1, y1)
                 rect_obj = fitz.Rect(*rect_coords)
-                # Adds a special PDF instruction: "This area is marked for death"
+                # White fill = invisible redaction. The text area becomes blank white space.
                 page.add_redact_annot(rect_obj, fill=settings.REDACTION_FILL_COLOR)
 
-        # Step 2: Execute Redactions
-        # PDF_REDACT_IMAGE_NONE ensures that we don't accidentally black out the background 
-        # document image if this was a scanned resume! We only destroy the TEXT in that area.
-        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+        # Step 2: Execute Text Redactions
+        # PDF_REDACT_IMAGE_NONE preserves embedded images while destroying text
+        if target_list:
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
         
-        # Step 2.5: Purge Clickable Hyperlinks (e.g. LinkedIn, GitHub)
-        # Even if visual text is destroyed, the <a> tag link rectangle might survive!
-        for link in page.get_links():
-            uri = link.get("uri", "").lower()
-            if any(domain in uri for domain in ["linkedin.com", "github.com", "wa.me", "mailto:", "facebook.com", "twitter.com", "portfolio", "bit.ly"]):
-                # Add a redaction to that exact link box to erase any underlying text
-                page.add_redact_annot(link["from"], fill=settings.REDACTION_FILL_COLOR)
-                # Sever the digital hyperlink connection
-                page.delete_link(link)
-                
-        # Must apply redactions AGAIN just in case the link loop caught something new
-        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+        # Step 3: Purge Clickable Hyperlinks
+        # 🎓 Teacher Note: Even after we erase the VISIBLE text "linkedin.com/in/john",
+        # the PDF might still contain an invisible CLICKABLE RECTANGLE that links to that URL.
+        # A company receiving the resume could hover over the blank space and still find the link!
+        # We must sever these digital hyperlinks too.
+        #
+        # BUG FIX: Previously we deleted links while iterating page.get_links().
+        # This is the classic "modify list while iterating" bug — it skips items.
+        # Fix: collect links to delete first, then delete in reverse order.
+        
+        links = page.get_links()
+        links_to_delete: list[dict] = []
+        
+        for link in links:
+            uri = link.get("uri", "")
+            if not uri:
+                continue
+            
+            uri_lower = uri.lower()
+            
+            # Check against our known identity domains
+            should_delete = any(domain in uri_lower for domain in IDENTITY_LINK_DOMAINS)
+            
+            # Also delete ANY external http(s) link — personal websites, portfolio, etc.
+            # 🎓 This is aggressive but correct for your use case:
+            # On a resume, ALL hyperlinks are either personal (bad) or company URLs (harmless but rare).
+            # Since you're a bridge service, removing all links is safer than missing one.
+            if uri_lower.startswith("http://") or uri_lower.startswith("https://") or uri_lower.startswith("mailto:"):
+                should_delete = True
+            
+            if should_delete:
+                links_to_delete.append(link)
+        
+        # Delete collected links and redact their visual rectangles
+        # 🎓 We iterate in REVERSE order because deleting a link changes the indices
+        # of subsequent links in the internal PDF structure.
+        for link in reversed(links_to_delete):
+            # Redact the visual area where the link text was displayed
+            page.add_redact_annot(link["from"], fill=settings.REDACTION_FILL_COLOR)
+            # Sever the digital hyperlink connection
+            page.delete_link(link)
+        
+        # Apply redactions again to clean up any link text we just marked
+        if links_to_delete:
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
-    # Step 3: Scrub Document Metadata (Crucial for Security!)
-    # Sometimes resumes have "Author: John Doe" in the hidden file properties.
+    # Step 4: Scrub Document Metadata
+    # 🎓 PDF files have hidden properties like "Author: John Doe" that most people
+    # never see but are trivially accessible. We wipe everything.
     doc.set_metadata({})
     doc.del_xml_metadata()
 
-    # Step 4: Serialize to memory bytes securely
+    # Step 5: Serialize to memory bytes
     buf = io.BytesIO()
     
-    # Save parameters:
-    # garbage=4   : Aggressive compression, deletes unused object paths.
-    # deflate=True: Zip compression.
-    # clean=True  : Sanitizes instruction streams.
+    # Save with aggressive cleanup:
+    # garbage=4   : Removes ALL unreferenced objects (orphaned text fragments)
+    # deflate=True: Compresses output (smaller file)
+    # clean=True  : Sanitizes instruction streams
     doc.save(buf, garbage=4, deflate=True, clean=True)
     
     sanitized_bytes = buf.getvalue()

@@ -4,7 +4,7 @@ services:
   sanitizer:
     build: .
     ports: 
-      - "8000:8000"
+      - "8080:8000" # Mapped to 8080 on your host machine to avoid "port is already allocated" errors
     environment:
       - CACHE_BACKEND=redis
       - REDIS_URL=redis://redis:6379/0

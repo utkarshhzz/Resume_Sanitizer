@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     RATE_LIMIT_WINDOW_SECONDS: int = 60
 
     # Redaction Styling
-    REDACTION_FILL_COLOR: tuple[float, float, float] = (0.0, 0.0, 0.0)  # RGB black
+    REDACTION_FILL_COLOR: tuple[float, float, float] = (1.0, 1.0, 1.0)  # RGB white — invisible redaction
     REDACTION_PADDING_PX: int = 2          # Extra pixels around each box to ensure no text leaks
 
 settings = Settings()

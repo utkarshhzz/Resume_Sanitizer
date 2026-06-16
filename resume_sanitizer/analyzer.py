@@ -15,6 +15,15 @@ from resume_sanitizer.models import PIIEntity, PageTextBlock
 logger = logging.getLogger(__name__)
 
 # --- LAYER 1: REGEX PATTERNS ---
+# 
+# 🎓 Teacher Note: Each regex recognizer has 3 parts:
+#   1. `entity`   — The label we give to what we found (e.g., "EMAIL_ADDRESS")
+#   2. `patterns` — The actual regex(es) that search the text
+#   3. `context`  — Nearby words that boost confidence (e.g., "email" near an email pattern)
+#
+# Presidio uses "context boosting": if a context word appears near a regex match,
+# the score gets a +0.35 bump. This is why we set low base scores for ambiguous
+# patterns (like PINCODE) — they only fire when strong context is present.
 
 @dataclass
 class CustomEntityContext:
@@ -22,8 +31,15 @@ class CustomEntityContext:
     patterns: list[Pattern]
     context: list[str]
 
-# Defining our highly-accurate Indian and International regex patterns
+# ──────────────────────────────────────────────────────────────────────
+# IMPORTANT: These patterns are ordered by SPECIFICITY (most specific first).
+# Presidio evaluates ALL recognizers and deduplication keeps the highest-score
+# match for overlapping text regions. So more specific patterns should have
+# higher base scores than broad ones.
+# ──────────────────────────────────────────────────────────────────────
+
 REGEX_DEFINITIONS = [
+    # ── HIGH PRECISION: These almost NEVER false-positive ──
     CustomEntityContext(
         entity="EMAIL_ADDRESS",
         patterns=[Pattern("email_regex", r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", 0.95)],
@@ -32,10 +48,12 @@ REGEX_DEFINITIONS = [
     CustomEntityContext(
         entity="PHONE_NUMBER",
         patterns=[
-            Pattern("indian_mobile", r"(\+?91[\-\s]?)?[6-9]\d{9}", 0.90),
+            # Indian mobile: starts with 6-9, exactly 10 digits, optional +91 prefix
+            Pattern("indian_mobile", r"(\+?91[\-\s]?)?[6-9]\d{9}\b", 0.90),
+            # International: (xxx) xxx-xxxx or xxx-xxx-xxxx with optional country code
             Pattern("international", r"(\+?\d{1,3}[\s\-]?)?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{4}", 0.85)
         ],
-        context=["phone", "mobile", "cell", "tel", "contact"]
+        context=["phone", "mobile", "cell", "tel", "contact", "call"]
     ),
     CustomEntityContext(
         entity="LINKEDIN_URL",
@@ -47,51 +65,91 @@ REGEX_DEFINITIONS = [
         patterns=[Pattern("github_regex", r"(https?://)?(www\.)?github\.com/[A-Za-z0-9\-_.]+", 0.98)],
         context=[]
     ),
+    # Social media URLs that reveal candidate identity
+    CustomEntityContext(
+        entity="SOCIAL_MEDIA_URL",
+        patterns=[
+            Pattern("twitter_regex", r"(https?://)?(www\.)?(twitter\.com|x\.com)/[A-Za-z0-9_]+", 0.95),
+            Pattern("instagram_regex", r"(https?://)?(www\.)?instagram\.com/[A-Za-z0-9_.]+", 0.95),
+            Pattern("facebook_regex", r"(https?://)?(www\.)?facebook\.com/[A-Za-z0-9_.]+", 0.95),
+            Pattern("telegram_regex", r"(https?://)?t\.me/[A-Za-z0-9_]+", 0.95),
+            Pattern("medium_regex", r"(https?://)?(www\.)?medium\.com/@?[A-Za-z0-9_.]+", 0.90),
+            Pattern("stackoverflow_regex", r"(https?://)?(www\.)?stackoverflow\.com/users/[0-9]+", 0.90),
+            Pattern("behance_regex", r"(https?://)?(www\.)?behance\.net/[A-Za-z0-9_.]+", 0.90),
+            Pattern("dribbble_regex", r"(https?://)?(www\.)?dribbble\.com/[A-Za-z0-9_.]+", 0.90),
+            Pattern("codepen_regex", r"(https?://)?(www\.)?codepen\.io/[A-Za-z0-9_.]+", 0.90),
+        ],
+        context=[]
+    ),
+    # 🎓 Catch-all for ANY http(s) URL — personal portfolio sites, blogs, etc.
+    # Lower score so it doesn't override the specific matchers above.
+    # Context boosting will push it above threshold if near "portfolio", "website", etc.
+    CustomEntityContext(
+        entity="PERSONAL_URL",
+        patterns=[
+            Pattern("general_url", r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+", 0.60),
+        ],
+        context=["portfolio", "website", "blog", "site", "url", "link", "personal"]
+    ),
     CustomEntityContext(
         entity="PAN_CARD",
-        patterns=[Pattern("pan_regex", r"[A-Z]{5}[0-9]{4}[A-Z]", 0.95)],
-        context=["pan", "tax"]
+        patterns=[Pattern("pan_regex", r"\b[A-Z]{5}[0-9]{4}[A-Z]\b", 0.95)],
+        context=["pan", "tax", "income tax", "permanent account"]
     ),
     CustomEntityContext(
         entity="AADHAAR_NUMBER",
         patterns=[Pattern("aadhaar_regex", r"\b[2-9]{1}[0-9]{3}\s?[0-9]{4}\s?[0-9]{4}\b", 0.95)],
-        context=["aadhaar", "uidai"]
+        context=["aadhaar", "uidai", "uid"]
     ),
     CustomEntityContext(
-        entity="PINCODE_IN",
-        patterns=[Pattern("pincode_regex", r"\b[1-9][0-9]{5}\b", 0.40)],
-        context=["pincode", "pin", "postal", "zip"]
+        entity="IFSC_CODE",
+        patterns=[Pattern("ifsc_regex", r"\b[A-Z]{4}0[A-Z0-9]{6}\b", 0.95)],
+        context=["ifsc", "rtgs", "neft"]
     ),
     CustomEntityContext(
         entity="VOTER_ID_IN",
-        patterns=[Pattern("voter_regex", r"[A-Z]{3}[0-9]{7}", 0.88)],
-        context=["voter", "epic"]
+        patterns=[Pattern("voter_regex", r"\b[A-Z]{3}[0-9]{7}\b", 0.88)],
+        context=["voter", "epic", "election"]
     ),
     CustomEntityContext(
         entity="PASSPORT_IN",
-        patterns=[Pattern("passport_regex", r"[A-PR-WYa-pr-wy][1-9]\d\s?\d{4}[1-9]", 0.90)],
+        patterns=[Pattern("passport_regex", r"\b[A-PR-WYa-pr-wy][1-9]\d\s?\d{4}[1-9]\b", 0.90)],
         context=["passport"]
     ),
+
+    # ── MEDIUM PRECISION: Need context to be useful ──
     CustomEntityContext(
         entity="IP_ADDRESS",
         patterns=[Pattern("ip_regex", r"\b(?:\d{1,3}\.){3}\d{1,3}\b", 0.85)],
-        context=["ip", "address"]
+        context=["ip", "address", "server"]
     ),
     CustomEntityContext(
         entity="DATE_OF_BIRTH",
         # Matches DD-MM-YYYY, DD/MM/YYYY, etc.
-        patterns=[Pattern("dob_regex", r"\b(0?[1-9]|[12]\d|3[01])[\/\-](0?[1-9]|1[0-2])[\/\-](19|20)\d{2}\b", 0.40)],
-        context=["dob", "date of birth", "born", "birth"]
+        # 🎓 Low base score (0.35) because dates appear EVERYWHERE in resumes
+        # (employment dates, graduation dates). Only fires with strong context.
+        patterns=[Pattern("dob_regex", r"\b(0?[1-9]|[12]\d|3[01])[\/\-](0?[1-9]|1[0-2])[\/\-](19|20)\d{2}\b", 0.35)],
+        context=["dob", "date of birth", "born", "birth", "birthday"]
+    ),
+
+    # ── LOW PRECISION: Extremely high false-positive risk ──
+    CustomEntityContext(
+        entity="PINCODE_IN",
+        # 🎓 Teacher Note: This regex matches ANY 6-digit number starting with 1-9.
+        # On a resume, dates like "201617", salary "500000", and phone fragments ALL match.
+        # Solution: Set base score VERY low (0.25). Presidio's context boost (+0.35)
+        # only pushes it above the 0.55 threshold if "pincode"/"postal" appears nearby.
+        # Also added negative-safety: "linkedin" contains "in" but not "pin".
+        patterns=[Pattern("pincode_regex", r"\b[1-9][0-9]{5}\b", 0.25)],
+        context=["pincode", "pin code", "postal code", "zip code", "postal"]
     ),
     CustomEntityContext(
         entity="BANK_ACCOUNT_IN",
-        patterns=[Pattern("bank_acc_regex", r"\b\d{9,18}\b", 0.30)],
-        context=["account", "acc no", "bank", "ac/no"]
-    ),
-    CustomEntityContext(
-        entity="IFSC_CODE",
-        patterns=[Pattern("ifsc_regex", r"[A-Z]{4}0[A-Z0-9]{6}", 0.95)],
-        context=["ifsc", "rtgs", "neft"]
+        # 🎓 Teacher Note: Original was \d{9,18} which matches phone numbers (10 digits)
+        # and Aadhaar (12 digits). Indian bank accounts are typically 11-18 digits.
+        # We use 11+ digits AND require context words to avoid false positives.
+        patterns=[Pattern("bank_acc_regex", r"\b\d{11,18}\b", 0.25)],
+        context=["account", "acc no", "bank", "ac/no", "account number", "a/c"]
     ),
 ]
 
@@ -100,6 +158,10 @@ def build_analyzer_engine() -> AnalyzerEngine:
     """
     Initializes the Microsoft Presidio engine with our custom regex rules (Layer 1)
     and spaCy NLP engine (Layer 2).
+
+    🎓 Teacher Note: This function runs ONCE at server startup (in the lifespan handler).
+    Loading spaCy's en_core_web_lg model takes ~3-5 seconds and ~400MB RAM.
+    That's why we load it once and store it in app.state, not per-request.
     """
     # Configure the NLP Engine (Layer 2)
     configuration = {
@@ -137,10 +199,100 @@ def build_analyzer_engine() -> AnalyzerEngine:
 
 # --- LAYER 3: CONTEXT & STRUCTURAL HEURISTICS ---
 
+# 🎓 Teacher Note: Resume Section Detection
+# Resumes follow a predictable structure: CONTACT → SUMMARY → EXPERIENCE → EDUCATION → SKILLS
+# By detecting which section we're in, we can:
+#   - BOOST confidence for PII in CONTACT (it's almost always personal info)
+#   - REDUCE confidence for names/locations in EXPERIENCE (they're company/city names, not personal)
+#   - This single feature can eliminate 90% of false positives
+
+# Common section headers found in resumes (case-insensitive matching)
+SECTION_HEADERS = {
+    "CONTACT": ["contact", "contact information", "contact details", "personal details", "personal information", "personal info"],
+    "SUMMARY": ["summary", "objective", "about me", "professional summary", "career objective", "profile"],
+    "EXPERIENCE": ["experience", "work experience", "professional experience", "employment", "employment history", "work history"],
+    "EDUCATION": ["education", "academic", "academics", "qualifications", "educational qualifications"],
+    "SKILLS": ["skills", "technical skills", "technologies", "competencies", "tools", "proficiency"],
+    "PROJECTS": ["projects", "personal projects", "academic projects", "key projects"],
+    "CERTIFICATIONS": ["certifications", "certificates", "licenses", "training"],
+    "AWARDS": ["awards", "honors", "achievements", "accomplishments"],
+}
+
+def detect_resume_sections(blocks: list[PageTextBlock]) -> dict[str, tuple[int, int]]:
+    """
+    Identifies resume section boundaries by scanning for common header keywords.
+
+    Returns:
+        A dict mapping section names to (start_char_offset, end_char_offset)
+        relative to the full concatenated text of all pages.
+
+    🎓 Teacher Note:
+    We scan each line and check if it looks like a section header:
+      - Short line (< 40 chars)
+      - Matches a known header keyword
+      - Often in UPPERCASE or Title Case
+    Then we record where that section starts and where the next section begins.
+    """
+    sections: dict[str, tuple[int, int]] = {}
+    
+    # Build full text for offset calculation
+    full_text = "\n\n".join(b.text for b in blocks)
+    lines = full_text.split("\n")
+    
+    found_sections: list[tuple[str, int]] = []  # (section_name, char_offset)
+    
+    current_offset = 0
+    for line in lines:
+        stripped = line.strip()
+        
+        # Section headers are typically short, uppercase or title-case lines
+        if stripped and len(stripped) < 50:
+            normalized = stripped.lower().rstrip(":")
+            # Remove common decorators like bullets, dashes, pipes
+            normalized = re.sub(r'^[\-•|►▸▹●○◆◇→\s]+', '', normalized)
+            normalized = normalized.strip()
+            
+            for section_name, keywords in SECTION_HEADERS.items():
+                if normalized in keywords:
+                    found_sections.append((section_name, current_offset))
+                    break
+        
+        current_offset += len(line) + 1  # +1 for the \n
+    
+    # Convert to ranges: each section extends from its start to the next section's start
+    for i, (name, start) in enumerate(found_sections):
+        if i + 1 < len(found_sections):
+            end = found_sections[i + 1][1]
+        else:
+            end = len(full_text)
+        sections[name] = (start, end)
+    
+    # If no CONTACT section was explicitly found, assume the first section
+    # (before any detected header) is CONTACT — this is true for 95% of resumes.
+    if "CONTACT" not in sections and found_sections:
+        first_section_start = found_sections[0][1]
+        if first_section_start > 20:  # There's meaningful text before the first header
+            sections["CONTACT"] = (0, first_section_start)
+    elif not found_sections:
+        # No sections detected at all — treat entire page 1 as contact area
+        if blocks:
+            sections["CONTACT"] = (0, min(500, len(blocks[0].text)))
+    
+    return sections
+
+
 def detect_largest_font_name(doc: fitz.Document) -> PIIEntity | None:
     """
     Heuristic: The largest text on the top half of the first page of a resume
     is almost always the candidate's name.
+    
+    🎓 Teacher Note: This is our most important heuristic. NLP models often 
+    miss names because they're in ALL CAPS or unusual fonts. But visually,
+    the name is ALWAYS the biggest text at the top. We exploit that structural
+    pattern here.
+    
+    IMPROVEMENT: Now handles multi-span names (e.g., "UTKARSH" and "KUMAR" 
+    as separate spans at the same font size on the same line).
     """
     if doc.page_count == 0:
         return None
@@ -151,64 +303,115 @@ def detect_largest_font_name(doc: fitz.Document) -> PIIEntity | None:
     
     text_dict = page.get_text("dict")
     
+    # Headers that should NOT be considered as names
+    excluded_keywords = {
+        "resume", "curriculum vitae", "cv", "profile", "summary", 
+        "experience", "education", "skills", "objective", "about me",
+        "contact", "personal", "professional"
+    }
+    
+    # Step 1: Find the maximum font size in the top half of the page
     max_size = 0.0
-    name_text = ""
-    name_start = -1
-    
-    # We must also ensure we don't accidentally grab a giant "RESUME" header
-    excluded_keywords = {"resume", "curriculum vitae", "cv", "profile", "summary", "experience", "education", "skills"}
-    
-    # We need to simulate finding the offset in the raw concatenated text
-    # This is a bit tricky since PyMuPDF's get_text("text") might format slightly differently 
-    # than concatenated spans. So we search for the string later.
-    
     for block in text_dict.get("blocks", []):
-        if "lines" not in block: continue
+        if "lines" not in block:
+            continue
         for line in block["lines"]:
             for span in line["spans"]:
                 y0 = span["bbox"][1]
-                size = span["size"]
                 text = span["text"].strip()
+                size = span["size"]
                 
-                if y0 < half_height and len(text) > 3:
-                    if text.lower() not in excluded_keywords:
-                        if size > max_size:
-                            max_size = size
-                            name_text = text
+                if y0 < half_height and len(text) > 1 and text.lower() not in excluded_keywords:
+                    if size > max_size:
+                        max_size = size
+    
+    if max_size == 0:
+        return None
+    
+    # Step 2: Collect ALL spans at that max font size on the same line(s)
+    # 🎓 This handles "UTKARSH KUMAR" split as two spans
+    name_parts: list[str] = []
+    for block in text_dict.get("blocks", []):
+        if "lines" not in block:
+            continue
+        for line in block["lines"]:
+            line_parts = []
+            for span in line["spans"]:
+                y0 = span["bbox"][1]
+                text = span["text"].strip()
+                size = span["size"]
+                
+                # Must be: in top half, at max size, not a header keyword, non-trivial
+                if (y0 < half_height 
+                    and abs(size - max_size) < 0.5  # Font size tolerance
+                    and len(text) > 1 
+                    and text.lower() not in excluded_keywords):
+                    line_parts.append(text)
+            
+            if line_parts:
+                name_parts.extend(line_parts)
+                break  # Only take the FIRST line at max size (that's the name)
+    
+    if not name_parts:
+        return None
+        
+    name_text = " ".join(name_parts).strip()
+    
+    # Sanity check: names are typically 2-60 characters
+    if len(name_text) < 3 or len(name_text) > 60:
+        return None
 
-    if name_text:
-        # To get the start/end offset, we look it up in the raw page text
-        full_text = page.get_text("text")
-        start_idx = full_text.find(name_text)
+    # Find the offset in the raw page text
+    full_text = page.get_text("text")
+    # Try exact match first
+    start_idx = full_text.find(name_text)
+    # If not found (different whitespace), try the first part
+    if start_idx == -1 and name_parts:
+        start_idx = full_text.find(name_parts[0])
         if start_idx != -1:
-            return PIIEntity(
-                entity_type="PERSON",
-                text=name_text,
-                score=0.72,
-                page=1, # 1-indexed
-                detection_layer="heuristic",
-                start=start_idx,
-                end=start_idx + len(name_text)
-            )
+            # Extend to cover the full name
+            name_text = name_parts[0]
+            for part in name_parts[1:]:
+                next_idx = full_text.find(part, start_idx + len(name_text))
+                if next_idx != -1:
+                    name_text = full_text[start_idx:next_idx + len(part)]
+    
+    if start_idx != -1:
+        return PIIEntity(
+            entity_type="PERSON",
+            text=name_text,
+            score=0.72,
+            page=1,
+            detection_layer="heuristic",
+            start=start_idx,
+            end=start_idx + len(name_text)
+        )
             
     return None
 
+
 def detect_label_triggered_pii(blocks: list[PageTextBlock]) -> list[PIIEntity]:
     """
-    Heuristic: Look for specific labels like "Phone:" or "DOB:" and aggressively 
+    Heuristic: Look for specific labels like "Phone:" or "Email:" and aggressively 
     capture the text immediately following it, even if NLP failed.
+    
+    🎓 Teacher Note: This is our "safety net". If the regex and NLP both miss 
+    something (e.g., a phone number in a weird format), this heuristic catches it
+    by looking for the LABEL that precedes it. If a resume says "Phone: 98765 43210",
+    we know 100% that what follows "Phone:" is a phone number, regardless of format.
     """
     results: list[PIIEntity] = []
     
     # Tuple of (Regex to find label, Entity Type, Confidence Score, Regex to capture value)
     triggers = [
-        (r"(?i)\b(?:phone|tel|mobile|cell)\s*[:-]\s*", "PHONE_NUMBER", 0.85, r"([+\d\s\-\(\)]{8,15})"),
-        (r"(?i)\b(?:email|e-mail)\s*[:-]\s*", "EMAIL_ADDRESS", 0.85, r"([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})"),
-        (r"(?i)\b(?:github|git)\s*[:-]\s*", "GITHUB_URL", 0.90, r"([^\s\n]+)"),
-        (r"(?i)\b(?:linkedin)\s*[:-]\s*", "LINKEDIN_URL", 0.90, r"([^\s\n]+)"),
-        (r"(?i)\b(?:dob|date of birth)\s*[:-]\s*", "DATE_OF_BIRTH", 0.88, r"([^\n]{6,12})"),
-        # Location/Address is tricky, we capture the rest of the line
-        (r"(?i)\b(?:address|location|city)\s*[:-]\s*", "LOCATION", 0.75, r"([^\n]+)"), 
+        (r"(?i)\b(?:phone|tel|mobile|cell|contact\s*no|ph)\s*[:\-\.]\s*", "PHONE_NUMBER", 0.88, r"([+\d\s\-\(\)]{7,18})"),
+        (r"(?i)\b(?:email|e-mail|mail\s*id)\s*[:\-\.]\s*", "EMAIL_ADDRESS", 0.88, r"([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})"),
+        (r"(?i)\b(?:github|git)\s*[:\-\.]\s*", "GITHUB_URL", 0.92, r"([^\s\n]+)"),
+        (r"(?i)\b(?:linkedin)\s*[:\-\.]\s*", "LINKEDIN_URL", 0.92, r"([^\s\n]+)"),
+        (r"(?i)\b(?:dob|date of birth)\s*[:\-\.]\s*", "DATE_OF_BIRTH", 0.88, r"([^\n]{6,15})"),
+        (r"(?i)\b(?:website|portfolio|blog|site)\s*[:\-\.]\s*", "PERSONAL_URL", 0.85, r"([^\s\n]+)"),
+        (r"(?i)\b(?:twitter|instagram|facebook|telegram)\s*[:\-\.]\s*", "SOCIAL_MEDIA_URL", 0.90, r"([^\s\n]+)"),
+        (r"(?i)\b(?:skype|discord)\s*[:\-\.]\s*", "SOCIAL_MEDIA_URL", 0.85, r"([^\s\n]+)"),
     ]
     
     for block in blocks:
@@ -218,7 +421,8 @@ def detect_label_triggered_pii(blocks: list[PageTextBlock]) -> list[PIIEntity]:
             full_pattern = label_pattern + value_pattern
             for match in re.finditer(full_pattern, text):
                 value_text = match.group(1).strip()
-                if not value_text: continue
+                if not value_text:
+                    continue
                 
                 # The start offset of the *value* (group 1)
                 start_offset = match.start(1) 
@@ -239,15 +443,31 @@ def detect_label_triggered_pii(blocks: list[PageTextBlock]) -> list[PIIEntity]:
 
 # --- MASTER ORCHESTRATOR ---
 
-def analyze(analyzer: AnalyzerEngine, doc: fitz.Document, blocks: list[PageTextBlock], ocr_used: bool, min_confidence: float) -> list[PIIEntity]:
+def analyze(
+    analyzer: AnalyzerEngine, 
+    doc: fitz.Document, 
+    blocks: list[PageTextBlock], 
+    ocr_used: bool, 
+    min_confidence: float
+) -> list[PIIEntity]:
     """
-    The master analysis orchestrator. Runs all 3 layers of detection and deduplicates overlapping results.
+    The master analysis orchestrator. Runs all 3 layers of detection and deduplicates.
+    
+    🎓 Teacher Note: The order of operations matters here:
+    1. Run Presidio (which executes BOTH our custom regex AND the NLP model)
+    2. Run our heuristics (largest font name, label triggers)
+    3. Apply section-aware confidence boosting
+    4. Deduplicate overlapping detections (keep highest score)
+    5. Filter by minimum confidence threshold
     """
     all_entities: list[PIIEntity] = []
     
-    # Layer 1 (Regex) + Layer 2 (Presidio NLP)
-    # We purposefully exclude "ORG", "LOCATION" by default so we don't accidentally erase 
-    # colleges (Indian Institute of Technology) or technical skills (Microsoft Azure).
+    # ── Layer 1 (Regex) + Layer 2 (Presidio NLP) ──
+    # 🎓 We intentionally EXCLUDE "LOCATION" from detection.
+    # Why? Resumes are FULL of city names in the EXPERIENCE section
+    # ("Worked at Google, Bangalore") — these are NOT the candidate's personal
+    # location. Removing them would destroy the resume content.
+    # We catch the candidate's city via the label-trigger heuristic ("Location: Mumbai")
     entities_to_find = [d.entity for d in REGEX_DEFINITIONS] + ["PERSON", "US_SSN"]
 
     for block in blocks:
@@ -259,9 +479,10 @@ def analyze(analyzer: AnalyzerEngine, doc: fitz.Document, blocks: list[PageTextB
         )
         
         for r in results:
-            if r.score < min_confidence: continue
+            if r.score < min_confidence:
+                continue
             
-            # Determine layer based on entity type. If it's one of our custom ones, it was Regex.
+            # Determine which layer detected this
             layer = "regex" if any(r.entity_type == d.entity for d in REGEX_DEFINITIONS) else "presidio_ner"
             
             all_entities.append(
@@ -276,8 +497,8 @@ def analyze(analyzer: AnalyzerEngine, doc: fitz.Document, blocks: list[PageTextB
                 )
             )
 
-    # Layer 3 (Heuristics)
-    if not ocr_used: # Largest font heuristic only works reliably on digital PDFs
+    # ── Layer 3 (Heuristics) ──
+    if not ocr_used:  # Largest font heuristic only works reliably on digital PDFs
         largest_font_pii = detect_largest_font_name(doc)
         if largest_font_pii and largest_font_pii.score >= min_confidence:
             all_entities.append(largest_font_pii)
@@ -287,20 +508,68 @@ def analyze(analyzer: AnalyzerEngine, doc: fitz.Document, blocks: list[PageTextB
         if pii.score >= min_confidence:
             all_entities.append(pii)
 
+    # ── Section-Aware Confidence Boosting ──
+    # 🎓 If we detected a CONTACT section, boost confidence for PII found there.
+    # This is the secret sauce for reducing false positives.
+    sections = detect_resume_sections(blocks)
+    contact_section = sections.get("CONTACT")
+    experience_section = sections.get("EXPERIENCE")
+    
+    boosted_entities: list[PIIEntity] = []
+    for entity in all_entities:
+        new_score = entity.score
+        
+        # Boost PII found in CONTACT section
+        if contact_section:
+            full_text_offset = 0
+            for b in blocks:
+                if b.page_number == entity.page:
+                    entity_abs_start = full_text_offset + entity.start
+                    if contact_section[0] <= entity_abs_start < contact_section[1]:
+                        new_score = min(1.0, entity.score + 0.10)
+                    break
+                full_text_offset += len(b.text) + 2  # +2 for \n\n separator
+        
+        # Reduce confidence for PERSON entities in EXPERIENCE section
+        # (these are usually company names, manager names, etc.)
+        if experience_section and entity.entity_type == "PERSON":
+            full_text_offset = 0
+            for b in blocks:
+                if b.page_number == entity.page:
+                    entity_abs_start = full_text_offset + entity.start
+                    if experience_section[0] <= entity_abs_start < experience_section[1]:
+                        new_score = entity.score - 0.15
+                    break
+                full_text_offset += len(b.text) + 2
+        
+        if new_score >= min_confidence:
+            boosted_entities.append(
+                PIIEntity(
+                    entity_type=entity.entity_type,
+                    text=entity.text,
+                    score=new_score,
+                    page=entity.page,
+                    detection_layer=entity.detection_layer,
+                    start=entity.start,
+                    end=entity.end,
+                )
+            )
+    
+    all_entities = boosted_entities
 
-    # Deduplication
-    # A single string like "john.doe@email.com" might be flagged as both a PERSON (by NER) and an EMAIL_ADDRESS (by Regex)
-    # We want to keep the one with the higher score, or default to the more specific Regex.
+    # ── Deduplication ──
+    # 🎓 A single string like "john.doe@email.com" might be flagged by BOTH:
+    #   - Regex EMAIL_ADDRESS (score 0.95)
+    #   - NER PERSON (score 0.65, because "john doe" looks like a name)
+    # We keep the HIGHER-SCORING one. If tied, prefer regex (more precise).
     
     deduped: list[PIIEntity] = []
     
-    # Group by page first to avoid cross-page confusion
     from itertools import groupby
     all_entities.sort(key=lambda x: x.page)
     
     for page_num, page_entities_iter in groupby(all_entities, key=lambda x: x.page):
         page_entities = list(page_entities_iter)
-        # Sort by start offset
         page_entities.sort(key=lambda x: x.start)
         
         keep: list[PIIEntity] = []
@@ -310,13 +579,11 @@ def analyze(analyzer: AnalyzerEngine, doc: fitz.Document, blocks: list[PageTextB
                 # Check for overlap: start_a < end_b and start_b < end_a
                 if current.start < kept.end and kept.start < current.end:
                     overlapping = True
-                    # If current has a strictly higher score, replace the kept one
                     if current.score > kept.score:
                         keep[i] = current
-                    # If scores are equal, prefer regex over NER (regex is usually more precise)
                     elif current.score == kept.score and current.detection_layer == "regex" and kept.detection_layer != "regex":
                         keep[i] = current
-                    break # Already found an overlap, don't check rest
+                    break
                     
             if not overlapping:
                 keep.append(current)

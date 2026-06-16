@@ -249,7 +249,7 @@ async def sanitize_resume(
     
     if return_metadata:
         import json
-        manifest = [{"type": e.entity_type, "layer": e.detection_layer, "score": e.score} for e in metadata.entities]
+        manifest = [{"type": e.entity_type, "layer": e.detection_layer, "score": e.score, "page": e.page} for e in metadata.entities]
         headers["X-Redaction-Manifest"] = json.dumps(manifest)
 
     return StreamingResponse(

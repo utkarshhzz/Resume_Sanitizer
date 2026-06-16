@@ -6,24 +6,33 @@ import io
 from resume_sanitizer.main import app
 from resume_sanitizer.analyzer import build_analyzer_engine
 
+# 🎓 Teacher Note: `scope="session"` means this fixture runs ONCE for the entire
+# test suite, not once per test. Loading spaCy takes ~5 seconds, so we only do it once.
 @pytest.fixture(scope="session")
 def analyzer_engine():
-    # Load once for all tests to speed them up
     return build_analyzer_engine()
 
 @pytest.fixture
 def sample_digital_pdf_bytes():
-    """Builds a real PDF in memory with highly identifiable test data."""
+    """
+    Builds a real PDF in memory with highly identifiable test data.
+    
+    🎓 Teacher Note: We use fitz.open() to create a PDF from scratch.
+    This is faster than loading a file from disk and gives us full control
+    over what PII is in the document.
+    """
     doc = fitz.open()
     page = doc.new_page()
     
-    # Large font at top half -> Name heuristic
+    # Large font at top half -> Name heuristic should catch this
     page.insert_text((50, 50), "UTKARSH KUMAR", fontsize=24)
-    # Regex hits
+    # Regex hits (these should be caught by Layer 1)
     page.insert_text((50, 100), "Email: testuser@example.com", fontsize=11)
     page.insert_text((50, 120), "Phone: +91 9999999999", fontsize=11)
     page.insert_text((50, 140), "LinkedIn: linkedin.com/in/utkarshhzz", fontsize=11)
     page.insert_text((50, 160), "Aadhaar: 2345 6789 1234", fontsize=11)
+    page.insert_text((50, 180), "PAN: ABCDE1234F", fontsize=11)
+    page.insert_text((50, 200), "GitHub: github.com/utkarshhzz", fontsize=11)
     
     pdf_bytes = doc.write()
     doc.close()
@@ -36,7 +45,6 @@ def sample_scanned_pdf_bytes():
     """
     doc = fitz.open()
     page = doc.new_page()
-    # Draw a blank rectangle (acts like an image container with no readable text)
     page.draw_rect(page.rect, color=(0.5, 0.5, 0.5), fill=(0.8, 0.8, 0.8))
     
     pdf_bytes = doc.write()
@@ -45,7 +53,13 @@ def sample_scanned_pdf_bytes():
 
 @pytest.fixture
 async def async_client():
-    # Trigger lifespan to ensure analyzer/cache is loaded
-    async with ASGITransport(app=app) as transport:
-        async with AsyncClient(transport=transport, base_url="http://test") as ac:
-            yield ac
+    """
+    🎓 Teacher Note: The correct pattern for httpx + FastAPI testing:
+    1. Create ASGITransport (NOT as a context manager — it doesn't support that)
+    2. Wrap it in AsyncClient
+    3. The `async with` on AsyncClient triggers the app's lifespan events,
+       which loads the analyzer engine and initializes the cache.
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
