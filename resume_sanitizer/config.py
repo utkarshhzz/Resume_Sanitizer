@@ -46,4 +46,7 @@ class Settings(BaseSettings):
     REDACTION_FILL_COLOR: tuple[float, float, float] = (1.0, 1.0, 1.0)  # RGB white — invisible redaction
     REDACTION_PADDING_PX: int = 2          # Extra pixels around each box to ensure no text leaks
 
+    # Offline: no runtime network calls; spaCy/Presidio/Tesseract run locally only
+    OFFLINE_MODE: bool = True
+
 settings = Settings()

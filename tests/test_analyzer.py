@@ -133,3 +133,75 @@ def test_section_detection():
     assert "EXPERIENCE" in sections
     assert "EDUCATION" in sections
     assert "SKILLS" in sections
+
+
+def test_skills_section_tech_not_redacted(analyzer_engine):
+    """Kafka, Supabase, etc. in Skills must not be flagged as PII."""
+    blocks = _make_dummy_block(
+        "Skills\nPython, Kafka, Supabase, Redis, Docker, PostgreSQL, React, AWS"
+    )
+    entities = analyze(analyzer_engine, fitz.open(), blocks, False, 0.55)
+    redacted_texts = {e.text.lower().strip() for e in entities}
+    assert "kafka" not in redacted_texts
+    assert "supabase" not in redacted_texts
+    assert "redis" not in redacted_texts
+
+
+def test_pipe_separated_links_merged(analyzer_engine):
+    """github.com/x | linkedin.com/y should be one redaction span including the pipe."""
+    blocks = _make_dummy_block(
+        "Contact\ngithub.com/keyurdev | linkedin.com/in/keyurdev"
+    )
+    entities = analyze(analyzer_engine, fitz.open(), blocks, False, 0.55)
+    url_entities = [e for e in entities if e.entity_type in ("SOCIAL_LINK_GROUP", "GITHUB_URL", "LINKEDIN_URL")]
+    assert len(url_entities) >= 1
+    # Merged group should include the pipe delimiter
+    assert any("|" in e.text for e in url_entities)
+
+
+def test_naukri_and_linkedin_prose_not_redacted(analyzer_engine):
+    """Job platform names in project descriptions must not be flagged as PII."""
+    blocks = _make_dummy_block(
+        "Projects\nImplemented API keys to scrape jobs from sites like LinkedIn and Naukri"
+    )
+    entities = analyze(analyzer_engine, fitz.open(), blocks, False, 0.55)
+    texts = {e.text.lower() for e in entities}
+    assert "naukri" not in texts
+    assert "linkedin" not in texts
+
+
+def test_school_address_not_redacted(analyzer_engine):
+    """School locality/city in education must stay (Manjri Pune, etc.)."""
+    blocks = _make_dummy_block(
+        "Education\nB.Tech, XYZ School, Manjri Pune, Maharashtra"
+    )
+    entities = analyze(analyzer_engine, fitz.open(), blocks, False, 0.55)
+    person_texts = [e.text for e in entities if e.entity_type == "PERSON"]
+    assert not any("manjri" in t.lower() for t in person_texts)
+
+
+def test_colleague_name_not_redacted(analyzer_engine):
+    """Other people's names in experience must not be redacted."""
+    blocks = _make_dummy_block(
+        "Experience\nWorked with manager John Smith on backend services"
+    )
+    entities = analyze(analyzer_engine, fitz.open(), blocks, False, 0.55)
+    person_texts = [e.text for e in entities if e.entity_type == "PERSON"]
+    assert not any("john smith" in t.lower() for t in person_texts)
+
+
+def test_candidate_name_redacted_everywhere(analyzer_engine):
+    """Candidate name must be redacted in header and body."""
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((50, 50), "KEYUR PATEL", fontsize=24)
+    page.insert_text((50, 100), "keyur@email.com", fontsize=11)
+    page.insert_text((50, 200), "Built system for Keyur Patel portfolio", fontsize=11)
+    pdf_bytes = doc.write()
+    doc.close()
+
+    from resume_sanitizer.parser import extract_text_digital
+    doc2, blocks = extract_text_digital(pdf_bytes)
+    entities = analyze(analyzer_engine, doc2, blocks, False, 0.55)
+    person_texts = " ".join(e.text.lower() for e in entities if e.entity_type == "PERSON")
+    assert "keyur" in person_texts

@@ -24,7 +24,11 @@ def extract_text_digital(pdf_bytes: bytes) -> tuple[fitz.Document, list[PageText
     try:
         # Open PDF from memory buffer entirely
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    except fitz.FileDataError as e:
+    except Exception as e:
+        # PyMuPDF raises different exceptions across versions:
+        #   - fitz.FileDataError (older versions)
+        #   - pymupdf.mupdf.FzErrorFormat (1.24+)
+        # We catch broadly and wrap in our custom exception.
         raise PDFCorruptedError(f"Failed to open PDF: {e}")
 
     blocks: list[PageTextBlock] = []

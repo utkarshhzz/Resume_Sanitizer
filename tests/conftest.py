@@ -1,4 +1,5 @@
 import pytest
+import pytest_asyncio
 import fitz
 from httpx import AsyncClient, ASGITransport
 import io
@@ -51,15 +52,21 @@ def sample_scanned_pdf_bytes():
     doc.close()
     return pdf_bytes
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def async_client():
     """
-    🎓 Teacher Note: The correct pattern for httpx + FastAPI testing:
-    1. Create ASGITransport (NOT as a context manager — it doesn't support that)
-    2. Wrap it in AsyncClient
-    3. The `async with` on AsyncClient triggers the app's lifespan events,
-       which loads the analyzer engine and initializes the cache.
+    🎓 Teacher Note: httpx's AsyncClient does NOT automatically trigger
+    FastAPI's lifespan events (startup/shutdown). But our app's lifespan
+    handler is where we load the analyzer engine and initialize the cache
+    (app.state.analyzer and app.state.cache).
+
+    Solution: We manually enter the lifespan context manager before
+    creating the test client. This runs the startup code (loading spaCy,
+    connecting cache) and ensures the shutdown code runs after tests finish.
     """
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        yield ac
+    # Manually trigger the lifespan to populate app.state
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            yield ac
+

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import io
 import logging
 import sys
 import time
@@ -10,7 +9,7 @@ from contextlib import asynccontextmanager
 from typing import List
 
 from fastapi import FastAPI, Request, UploadFile, File, Query
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from pythonjsonlogger import jsonlogger
@@ -72,7 +71,16 @@ app = FastAPI(
 )
 
 # --- MIDDLEWARE REGISTRATION (Order matters: outer to inner) ---
-app.add_middleware(CORSMiddleware, allow_origins=settings.CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=[
+        "X-Request-ID", "X-PII-Count", "X-OCR-Used", "X-Cache",
+        "X-Processing-Time-Ms", "X-Redaction-Manifest", "Content-Disposition",
+    ],
+)
 app.add_middleware(RateLimitMiddleware)
 app.add_middleware(FileSizeMiddleware)
 app.add_middleware(LoggingMiddleware)
@@ -214,18 +222,20 @@ async def process_pdf(request: Request, file_bytes: bytes, filename: str, min_co
     return sanitized_bytes, metadata
 
 
-@app.post(f"{settings.API_PREFIX}/sanitize", response_class=StreamingResponse)
+@app.post(f"{settings.API_PREFIX}/sanitize", response_class=Response)
 async def sanitize_resume(
     request: Request,
     file: UploadFile = File(...),
     return_metadata: bool = Query(False, description="Include PII entity metadata in response headers"),
     min_confidence: float = Query(0.55, ge=0.0, le=1.0, description="Minimum Presidio confidence score"),
     redact_types: str = Query(None, description="Comma-separated list of entities to redact")
-) -> StreamingResponse:
+) -> Response:
     """Primary endpoint. Ingests a PDF and spits back a permanent-blacked-out version."""
     if file.content_type not in settings.ALLOWED_CONTENT_TYPES:
-        metrics.REQUEST_COUNT.labels(status="415").inc()
-        raise InvalidFileTypeError()
+        # Some clients send application/octet-stream for PDF uploads
+        if file.content_type != "application/octet-stream" or not (file.filename or "").lower().endswith(".pdf"):
+            metrics.REQUEST_COUNT.labels(status="415").inc()
+            raise InvalidFileTypeError()
 
     pdf_bytes = await file.read()
     
@@ -252,10 +262,10 @@ async def sanitize_resume(
         manifest = [{"type": e.entity_type, "layer": e.detection_layer, "score": e.score, "page": e.page} for e in metadata.entities]
         headers["X-Redaction-Manifest"] = json.dumps(manifest)
 
-    return StreamingResponse(
-        content=io.BytesIO(sanitized_bytes), # type: ignore
+    return Response(
+        content=sanitized_bytes,  # type: ignore[arg-type]
         media_type="application/pdf",
-        headers=headers
+        headers=headers,
     )
 
 

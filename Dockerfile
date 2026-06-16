@@ -34,12 +34,11 @@ USER appuser
 EXPOSE 8000
 
 # 6. Production Server Command
-# Using Gunicorn with Uvicorn workers gives us the best of both worlds:
-# Gunicorn handles process management (restarting dead workers), and Uvicorn handles the Async event loop.
+# Single worker: en_core_web_lg is ~600MB; multiple workers OOM on typical dev machines.
 CMD ["gunicorn", "resume_sanitizer.main:app", \
      "--worker-class", "uvicorn.workers.UvicornWorker", \
-     "--workers", "4", \
+     "--workers", "1", \
      "--bind", "0.0.0.0:8000", \
-     "--timeout", "60", \
+     "--timeout", "120", \
      "--preload", \
      "--access-logfile", "-"]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -11,6 +12,12 @@ from presidio_analyzer.nlp_engine import NlpEngineProvider
 
 from resume_sanitizer.config import settings
 from resume_sanitizer.models import PIIEntity, PageTextBlock
+from resume_sanitizer.candidate import (
+    build_candidate_profile,
+    filter_to_candidate_person_only,
+    find_candidate_name_occurrences,
+    is_platform_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +71,18 @@ REGEX_DEFINITIONS = [
         entity="GITHUB_URL",
         patterns=[Pattern("github_regex", r"(https?://)?(www\.)?github\.com/[A-Za-z0-9\-_.]+", 0.98)],
         context=[]
+    ),
+    # Pipe-separated social/profile links on one line (e.g. github.com/x | linkedin.com/in/y)
+    CustomEntityContext(
+        entity="SOCIAL_LINK_GROUP",
+        patterns=[Pattern(
+            "pipe_social_links",
+            r"(?:https?://)?(?:www\.)?(?:github\.com|linkedin\.com|gitlab\.com|bitbucket\.org)/"
+            r"[^\s|•·]+(?:\s*[|•·]\s*(?:https?://)?(?:www\.)?"
+            r"(?:github\.com|linkedin\.com|gitlab\.com|bitbucket\.org)/[^\s|•·]+)+",
+            0.99,
+        )],
+        context=[],
     ),
     # Social media URLs that reveal candidate identity
     CustomEntityContext(
@@ -163,6 +182,11 @@ def build_analyzer_engine() -> AnalyzerEngine:
     Loading spaCy's en_core_web_lg model takes ~3-5 seconds and ~400MB RAM.
     That's why we load it once and store it in app.state, not per-request.
     """
+    if settings.OFFLINE_MODE:
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
     # Configure the NLP Engine (Layer 2)
     configuration = {
         "nlp_engine_name": "spacy",
@@ -217,6 +241,165 @@ SECTION_HEADERS = {
     "CERTIFICATIONS": ["certifications", "certificates", "licenses", "training"],
     "AWARDS": ["awards", "honors", "achievements", "accomplishments"],
 }
+
+# Entity types that are always redacted regardless of resume section (high-precision PII)
+ALWAYS_REDACT_ENTITY_TYPES = frozenset({
+    "EMAIL_ADDRESS", "PHONE_NUMBER", "LINKEDIN_URL", "GITHUB_URL", "SOCIAL_MEDIA_URL",
+    "SOCIAL_LINK_GROUP", "PERSONAL_URL", "PAN_CARD", "AADHAAR_NUMBER", "IFSC_CODE",
+    "VOTER_ID_IN", "PASSPORT_IN", "US_SSN", "IP_ADDRESS", "DATE_OF_BIRTH",
+    "BANK_ACCOUNT_IN", "PINCODE_IN",
+})
+
+# Sections where NER/heuristic names should NOT be redacted (skills, projects, etc.)
+PROTECTED_CONTENT_SECTIONS = frozenset({"SKILLS", "PROJECTS", "EDUCATION", "CERTIFICATIONS", "AWARDS"})
+
+URL_ENTITY_TYPES = frozenset({
+    "LINKEDIN_URL", "GITHUB_URL", "SOCIAL_MEDIA_URL", "SOCIAL_LINK_GROUP", "PERSONAL_URL",
+})
+
+# Common tech/tools that NER or broad matchers falsely flag — never redact these alone
+TECH_SKILL_WHITELIST = frozenset({
+    "kafka", "supabase", "redis", "postgresql", "postgres", "mongodb", "mysql", "mariadb",
+    "docker", "kubernetes", "k8s", "react", "reactjs", "angular", "vue", "vuejs", "nextjs",
+    "nodejs", "node.js", "python", "java", "javascript", "typescript", "golang", "rust",
+    "aws", "azure", "gcp", "terraform", "ansible", "jenkins", "gitlab", "graphql",
+    "fastapi", "django", "flask", "spring", "hibernate", "elasticsearch", "rabbitmq",
+    "celery", "nginx", "apache", "linux", "unix", "windows", "macos", "android", "ios",
+    "swift", "kotlin", "scala", "hadoop", "spark", "airflow", "dbt", "snowflake",
+    "databricks", "tableau", "powerbi", "pandas", "numpy", "scikit-learn", "pytorch",
+    "tensorflow", "opencv", "selenium", "cypress", "jest", "pytest", "maven", "gradle",
+    "npm", "yarn", "webpack", "vite", "tailwind", "bootstrap", "sass", "less",
+    "microservices", "rest", "restful", "grpc", "websocket", "oauth", "jwt",
+    "ci/cd", "devops", "agile", "scrum", "jira", "confluence", "figma", "postman",
+    "swagger", "openapi", "firebase", "heroku", "vercel", "netlify", "cloudflare",
+    "datadog", "sentry", "prometheus", "grafana", "splunk", "elastic", "kibana",
+    "cassandra", "dynamodb", "neo4j", "sqlite", "oracle", "sql", "nosql", "html",
+    "css", "sass", "xml", "json", "yaml", "toml", "markdown", "latex",
+})
+
+_PIPE_CHARS = frozenset("|•·")
+
+
+def _entity_absolute_offset(blocks: list[PageTextBlock], entity: PIIEntity) -> int:
+    """Map a page-local entity offset to the concatenated multi-page text offset."""
+    offset = 0
+    for block in blocks:
+        if block.page_number == entity.page:
+            return offset + entity.start
+        offset += len(block.text) + 2
+    return entity.start
+
+
+def _section_for_offset(sections: dict[str, tuple[int, int]], abs_offset: int) -> str | None:
+    for name, (start, end) in sections.items():
+        if start <= abs_offset < end:
+            return name
+    return None
+
+
+def _is_whitelisted_skill(text: str) -> bool:
+    normalized = text.strip().lower().rstrip(".,;:")
+    if normalized in TECH_SKILL_WHITELIST:
+        return True
+    # Comma/pipe-separated skill tokens: "Kafka, Supabase"
+    for part in re.split(r"[,|/•·]", normalized):
+        token = part.strip()
+        if token and token not in TECH_SKILL_WHITELIST:
+            return False
+    return bool(normalized)
+
+
+def merge_pipe_delimited_urls(entities: list[PIIEntity], blocks: list[PageTextBlock]) -> list[PIIEntity]:
+    """
+    Merge adjacent URL entities on the same line when separated only by | • or whitespace,
+    so delimiters are included in the redacted span.
+    """
+    block_map = {b.page_number: b for b in blocks}
+    by_page: dict[int, list[PIIEntity]] = {}
+    other: list[PIIEntity] = []
+
+    for entity in entities:
+        if entity.entity_type in URL_ENTITY_TYPES:
+            by_page.setdefault(entity.page, []).append(entity)
+        else:
+            other.append(entity)
+
+    merged: list[PIIEntity] = list(other)
+    for page_num, page_entities in by_page.items():
+        page_entities.sort(key=lambda e: e.start)
+        block = block_map.get(page_num)
+        if not block:
+            merged.extend(page_entities)
+            continue
+
+        i = 0
+        while i < len(page_entities):
+            current = page_entities[i]
+            group_start = current.start
+            group_end = current.end
+            group_score = current.score
+            group_layer = current.detection_layer
+            j = i + 1
+
+            while j < len(page_entities):
+                nxt = page_entities[j]
+                between = block.text[group_end:nxt.start]
+                if between.strip() and all(c in _PIPE_CHARS or c.isspace() for c in between):
+                    group_end = nxt.end
+                    group_score = max(group_score, nxt.score)
+                    j += 1
+                else:
+                    break
+
+            merged.append(PIIEntity(
+                entity_type="SOCIAL_LINK_GROUP" if j > i + 1 else current.entity_type,
+                text=block.text[group_start:group_end],
+                score=group_score,
+                page=page_num,
+                detection_layer=group_layer,
+                start=group_start,
+                end=group_end,
+            ))
+            i = j
+
+    return merged
+
+
+def filter_false_positives(
+    entities: list[PIIEntity],
+    blocks: list[PageTextBlock],
+    sections: dict[str, tuple[int, int]],
+) -> list[PIIEntity]:
+    """Drop NER/heuristic noise in skills/projects and whitelisted tech terms."""
+    filtered: list[PIIEntity] = []
+
+    for entity in entities:
+        text = entity.text.strip()
+        if not text:
+            continue
+
+        if _is_whitelisted_skill(text):
+            continue
+
+        if is_platform_name(text):
+            continue
+
+        abs_offset = _entity_absolute_offset(blocks, entity)
+        section = _section_for_offset(sections, abs_offset)
+
+        if section in PROTECTED_CONTENT_SECTIONS:
+            if entity.entity_type not in ALWAYS_REDACT_ENTITY_TYPES:
+                continue
+            # In skills/projects, only redact if it looks like a real URL/email/phone
+            if entity.entity_type in URL_ENTITY_TYPES and not re.search(
+                r"(github\.com|linkedin\.com|gitlab\.com|bitbucket\.org|@|https?://)", text, re.I
+            ):
+                continue
+
+        filtered.append(entity)
+
+    return filtered
+
 
 def detect_resume_sections(blocks: list[PageTextBlock]) -> dict[str, tuple[int, int]]:
     """
@@ -498,10 +681,11 @@ def analyze(
             )
 
     # ── Layer 3 (Heuristics) ──
+    header_name: PIIEntity | None = None
     if not ocr_used:  # Largest font heuristic only works reliably on digital PDFs
-        largest_font_pii = detect_largest_font_name(doc)
-        if largest_font_pii and largest_font_pii.score >= min_confidence:
-            all_entities.append(largest_font_pii)
+        header_name = detect_largest_font_name(doc)
+        if header_name and header_name.score >= min_confidence:
+            all_entities.append(header_name)
             
     heuristic_label_piis = detect_label_triggered_pii(blocks)
     for pii in heuristic_label_piis:
@@ -557,6 +741,9 @@ def analyze(
     
     all_entities = boosted_entities
 
+    # ── Merge pipe-separated URL groups (github.com/x | linkedin.com/y) ──
+    all_entities = merge_pipe_delimited_urls(all_entities, blocks)
+
     # ── Deduplication ──
     # 🎓 A single string like "john.doe@email.com" might be flagged by BOTH:
     #   - Regex EMAIL_ADDRESS (score 0.95)
@@ -590,4 +777,25 @@ def analyze(
                 
         deduped.extend(keep)
 
-    return deduped
+    # ── Candidate-only name redaction (drop Naukri, school cities, colleague names) ──
+    profile = build_candidate_profile(blocks, sections, deduped, header_name)
+    deduped = filter_to_candidate_person_only(deduped, profile, header_name)
+    if profile:
+        deduped.extend(find_candidate_name_occurrences(blocks, profile, min_confidence))
+        # Re-dedupe after adding name occurrences
+        deduped.sort(key=lambda x: (x.page, x.start))
+        final: list[PIIEntity] = []
+        for current in deduped:
+            overlap = False
+            for i, kept in enumerate(final):
+                if current.page == kept.page and current.start < kept.end and kept.start < current.end:
+                    overlap = True
+                    if current.score > kept.score:
+                        final[i] = current
+                    break
+            if not overlap:
+                final.append(current)
+        deduped = final
+
+    # ── False-positive filter (skills whitelist, section-aware) ──
+    return filter_false_positives(deduped, blocks, sections)
