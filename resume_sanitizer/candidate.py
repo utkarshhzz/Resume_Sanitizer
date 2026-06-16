@@ -67,11 +67,17 @@ def build_candidate_profile(
         offset += len(block.text) + 2
 
     contact = sections.get("CONTACT")
+    first_section_start = min((s[0] for s in sections.values()), default=10_000)
+
     for entity in entities:
         abs_start = block_offsets.get(entity.page, 0) + entity.start
-        in_contact = bool(contact and contact[0] <= abs_start < contact[1])
-        if not contact and entity.page == 1:
-            in_contact = abs_start < 600
+        if contact:
+            in_contact = contact[0] <= abs_start < contact[1]
+        elif entity.page == 1 and abs_start < first_section_start:
+            # Text above the first section header is the contact block
+            in_contact = True
+        else:
+            in_contact = False
 
         if entity.entity_type == "PERSON" and in_contact:
             name_candidates.append(entity.text.strip())
