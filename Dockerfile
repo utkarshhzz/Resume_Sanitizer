@@ -1,7 +1,6 @@
 FROM python:3.11-slim-bookworm
 
-# 1. Install system dependencies
-# PyMuPDF and Tesseract require C-level system libraries to process images and PDFs.
+# System deps for PyMuPDF, Tesseract OCR, and pdf2image
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     tesseract-ocr-eng \
@@ -12,29 +11,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# 2. Layer Cache Optimization
-# We copy ONLY the requirements file first. If we don't change our packages,
-# Docker caches this step and skips it on future builds, saving minutes!
+# Install Python deps first (layer cache — only rebuilds if requirements.txt changes)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 3. Bake in the ML Model
-# We download the NLP model inside the Docker image so the container 
-# doesn't have to download it from the internet every time it spins up (which causes huge cold-start delays).
+# Bake the spaCy model into the image (avoids runtime download)
 RUN python -m spacy download en_core_web_lg
 
-# 4. Copy the actual application code
-COPY . .
+# Copy application code
+COPY resume_sanitizer/ ./resume_sanitizer/
+COPY prometheus.yml .
 
-# 5. Security: Run as a non-root user
-# If a hacker somehow breaks out of the Python app, they won't have root permissions on the container.
+# Run as non-root for security
 RUN adduser --disabled-password --gecos "" appuser
 USER appuser
 
+# Set offline mode so no runtime network calls are attempted
+ENV OFFLINE_MODE=true
+ENV TRANSFORMERS_OFFLINE=1
+ENV HF_DATASETS_OFFLINE=1
+ENV HF_HUB_OFFLINE=1
+
 EXPOSE 8000
 
-# 6. Production Server Command
-# Single worker: en_core_web_lg is ~600MB; multiple workers OOM on typical dev machines.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Production server — single worker (spaCy model is ~600MB per worker)
 CMD ["gunicorn", "resume_sanitizer.main:app", \
      "--worker-class", "uvicorn.workers.UvicornWorker", \
      "--workers", "1", \

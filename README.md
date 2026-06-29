@@ -1,114 +1,105 @@
-# Resume Sanitizer API 🕵️‍♂️🛡️
+# Resume Sanitizer
 
-A production-ready microservice built with **FastAPI** that automatically detects and permanently redacts Personally Identifiable Information (PII) from PDF resumes using a high-accuracy 3-layer hybrid engine.
+A production-grade microservice that removes personally identifiable information (PII) from resumes. Upload a PDF, get back a clean version with names, emails, phone numbers, social links, and other sensitive data permanently erased — as if the info was never there.
 
-**Use Case**: Acts as a bridge between recruitment agencies and companies — resumes arrive clean with no way to contact candidates directly.
+## What Gets Removed
 
-## 🚀 Architecture
+| Category | Examples |
+|---|---|
+| **Contact Info** | Email, phone numbers (Indian/international), LinkedIn, GitHub |
+| **Social Media** | Twitter/X, Instagram, Facebook, Telegram, Medium, Behance, Dribbble |
+| **Identity Docs** | PAN card, Aadhaar, Voter ID, Passport, SSN |
+| **Financial** | Bank account numbers, IFSC codes |
+| **URLs** | Personal websites, portfolios, blogs |
+| **Metadata** | PDF Author, Title, Subject, XML metadata |
+| **Hyperlinks** | All clickable links are severed from the PDF |
 
-```
-PDF Upload → Parser (Text Extraction + OCR Fallback) → 3-Layer PII Analyzer → Redactor → Clean PDF
-```
+## What Stays
 
-- **Layer 1 (Regex)**: Zero-cost, ~100% precision pattern matching for structured PII:
-  - Email addresses, phone numbers (Indian + International)
-  - LinkedIn, GitHub, Twitter, Instagram, Facebook, Telegram URLs
-  - PAN cards, Aadhaar numbers, IFSC codes, Voter IDs, Passports
-  - Personal portfolio/website URLs (catch-all)
-  
-- **Layer 2 (NLP NER)**: Contextual named entity recognition via spaCy + Microsoft Presidio for unstructured PII (names, locations).
+- Work experience, education, skills, projects, certifications
+- Company names, technologies, tools
+- School/college addresses
+- Resume formatting and layout
 
-- **Layer 3 (Heuristics)**: Smart structural rules:
-  - "Largest font at the top = candidate's name" (multi-span aware)
-  - Label-triggered detection: `Phone:`, `Email:`, `GitHub:`, `LinkedIn:`, `DOB:`, etc.
-  - Section-aware confidence boosting (CONTACT section gets +0.10 boost, EXPERIENCE section gets -0.15 for PERSON entities to avoid false positives on company names)
-
-- **OCR Fallback**: Automatically detects scanned (image-only) PDFs and falls back to Tesseract OCR.
-
-- **Deep Redaction**: 
-  - White-fill redaction (invisible — looks like info was never there)
-  - Physically removes text from PDF binary structure (not just a visual overlay)
-  - Purges ALL clickable hyperlinks (LinkedIn, GitHub, email mailto:, personal sites)
-  - Scrubs document metadata (Author, Title, Subject, Keywords, Producer, Creator)
-  - Removes embedded XML metadata streams
-
-## 📦 Quickstart (Docker)
-
-The fastest way to run this locally with the full stack (App + Redis + Prometheus + Grafana):
+## Quick Start (Docker)
 
 ```bash
-docker-compose up --build
-```
-> The API will be available at `http://localhost:8080`
+# Build and run everything
+docker compose up --build
 
-### Local Development (without Docker)
+# Service available at:
+# API:        http://localhost:8000
+# Swagger UI: http://localhost:8000/docs
+# Health:     http://localhost:8000/health
+# Metrics:    http://localhost:9090 (Prometheus)
+# Dashboard:  http://localhost:3000 (Grafana, admin/admin)
+```
+
+## Quick Start (Local Dev)
 
 ```bash
-# 1. Create virtual environment
 python -m venv venv
-venv\Scripts\activate  # Windows
-
-# 2. Install dependencies
+.\venv\Scripts\activate        # Windows
 pip install -r requirements.txt
 python -m spacy download en_core_web_lg
 
-# 3. Run
-uvicorn resume_sanitizer.main:app --reload --port 8000
+# Run
+python -m uvicorn resume_sanitizer.main:app --reload --port 8000
 ```
 
-## 🕹️ API Reference
+## API Endpoints
 
-### 1. `POST /api/v1/sanitize`
-Upload a PDF. Receive a fully sanitized PDF back (white-space redaction).
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/sanitize` | Upload PDF → get sanitized PDF back |
+| `POST` | `/api/v1/analyze-only` | Dry run — returns detected PII as JSON |
+| `POST` | `/api/v1/batch` | Process up to 10 PDFs concurrently |
+| `GET` | `/api/v1/entities` | List all detectable PII types |
+| `GET` | `/health` | Health check for load balancers |
+
+### Sanitize Example
 
 ```bash
-curl -X POST "http://localhost:8000/api/v1/sanitize?return_metadata=true" \
-  -H "accept: application/pdf" \
-  -H "Content-Type: multipart/form-data" \
-  -F "file=@my_resume.pdf" \
-  --output sanitized.pdf
+curl -X POST "http://localhost:8000/api/v1/sanitize" \
+  -F "file=@resume.pdf" \
+  -o sanitized_resume.pdf
 ```
 
-**Query Parameters:**
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `return_metadata` | bool | false | Include PII entity metadata in response headers |
-| `min_confidence` | float | 0.55 | Minimum detection confidence (0.0–1.0) |
-| `redact_types` | string | null | Comma-separated list of entity types to redact (e.g., `EMAIL_ADDRESS,PHONE_NUMBER`) |
+### Response Headers
 
-**Response Headers:**
-- `X-PII-Count`: Total number of entities redacted
-- `X-OCR-Used`: Whether OCR fallback was triggered
-- `X-Cache`: `HIT` or `MISS`
-- `X-Processing-Time-Ms`: Pipeline execution time
-- `X-Redaction-Manifest` (when `return_metadata=true`): JSON array of redacted entities with type, layer, score, and page
+| Header | Description |
+|---|---|
+| `X-PII-Count` | Number of PII entities detected |
+| `X-OCR-Used` | Whether OCR was needed (scanned PDF) |
+| `X-Cache` | `HIT` if result was cached |
+| `X-Processing-Time-Ms` | Total processing time |
 
-### 2. `POST /api/v1/analyze-only`
-Finds PII and returns a JSON list with details, but does **NOT** redact the PDF. Great for debugging and confidence tuning.
+## Architecture
+
+```
+PDF Upload → Parser (PyMuPDF/Tesseract OCR)
+           → Analyzer (Regex + spaCy NER + Heuristics)
+           → Redactor (Physical text removal + link severing)
+           → Clean PDF
+```
+
+### Detection Layers
+
+1. **Regex** — High-precision patterns for emails, phones, URLs, PAN, Aadhaar, etc.
+2. **NLP (spaCy)** — Named entity recognition for person names
+3. **Heuristics** — Largest font = name, label triggers ("Phone: xxx"), section-aware confidence boosting
+
+## Testing
 
 ```bash
-curl -X POST "http://localhost:8000/api/v1/analyze-only" \
-  -H "accept: application/json" \
-  -H "Content-Type: multipart/form-data" \
-  -F "file=@my_resume.pdf"
+python -m pytest tests/ -v
 ```
 
-### 3. `POST /api/v1/batch`
-Process up to 10 PDFs concurrently. Returns metadata + base64-encoded sanitized PDFs.
+## Tech Stack
 
-### 4. `GET /health` & `GET /api/v1/entities`
-Health check and list of all supported PII detection patterns.
-
-## ⚙️ Environment Variables
-Check `.env.example` for all configurable limits (Rate Limiting, Cache TTLs, OCR settings, etc.).
-
-## 📊 Monitoring
-- **Prometheus**: `http://localhost:9090` — Metrics scraping
-- **Grafana**: `http://localhost:3000` — Dashboard (admin/admin)
-- **Metrics endpoint**: `http://localhost:8000/metrics`
-
-## 🧪 Testing
-
-```bash
-python -m pytest tests/ -v --tb=short
-```
+- **FastAPI** + **Gunicorn** — async API server
+- **PyMuPDF** — PDF parsing and physical redaction
+- **Tesseract OCR** — scanned PDF fallback
+- **Presidio + spaCy** — PII detection engine
+- **Redis** — response caching
+- **Prometheus + Grafana** — metrics and monitoring
